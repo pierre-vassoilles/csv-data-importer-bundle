@@ -6,7 +6,7 @@
  * Time: 09:26
  */
 
-namespace Pv\CsvDataImporterBundle\Model;
+namespace CsvDataImporterBundle\Model;
 
 
 class FieldDescription
@@ -17,7 +17,7 @@ class FieldDescription
     protected $required = false;
 
     protected $setter;
-
+ 
     protected $hook;
 
 

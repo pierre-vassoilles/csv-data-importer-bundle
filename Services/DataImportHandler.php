@@ -6,11 +6,13 @@
  * Time: 09:31
  */
 
-namespace Pv\CsvDataImporterBundle\Services;
+namespace CsvDataImporterBundle\Services;
 
 
+use CsvDataImporterBundle\Model\DataImportResult;
+use Doctrine\Common\Collections\ArrayCollection;
 use Doctrine\ORM\EntityManager;
-use Pv\CsvDataImporterBundle\Model\FieldDescription;
+use CsvDataImporterBundle\Model\FieldDescription;
 use Symfony\Component\Debug\Exception\ClassNotFoundException;
 
 class DataImportHandler
@@ -51,6 +53,15 @@ class DataImportHandler
     /** @var array $fields */
     protected $fields = array();
 
+    /** @var \Closure $checkForExistanceClosure */
+    protected $checkForExistanceClosure;
+
+    /** @var \Closure $prePersistClosure */
+    protected $prePersistClosure;
+
+    /** @var \Closure $postPersistClosure */
+    protected $postPersistClosure;
+
     /**
      * DataImportHandler constructor.
      *
@@ -85,7 +96,7 @@ class DataImportHandler
             throw new ClassNotFoundException(sprintf('The class %s was not found, did you misspelled it ?', $classname), new \ErrorException(''));
         }
 
-        if (file_exists($filename)) {
+        if (!file_exists($filename)) {
             throw new \InvalidArgumentException(sprintf('The file %s you provided was not found on this server.', $filename));
         }
 
@@ -97,6 +108,10 @@ class DataImportHandler
         ) {
             throw new \InvalidArgumentException('The import mode you provided was not found. Please use DataImportHandler\'s constants.');
         }
+
+        $this->fields = array();
+        $this->identifierFieldname = null;
+        $this->identifierPosition = null;
 
         $this->classname = $classname;
         $this->filename = $filename;
@@ -188,7 +203,7 @@ class DataImportHandler
         if ($this->getFieldByPosition($position)) {
             $this->getFieldByPosition($position)->setHook($closure);
         } else {
-            throw new \Exception(sprintf('No field was found at position %d', $position));
+            throw new \Exception(sprintf('[Import Hooks] No field was found at position %d', $position));
         }
 
         return $this;
@@ -198,11 +213,11 @@ class DataImportHandler
      * Launches the Import Process. <br>
      * Returns an array of errors. If this array is empty, nos errors was found in the file.
      *
-     * @return array
+     * @return DataImportResult
      *
      * @throws \Exception
      */
-    public function doImport()
+    public function doImport($debug = false, $fake = false)
     {
 
         if (!$this->isInitialized) {
@@ -213,8 +228,9 @@ class DataImportHandler
             throw new \Exception('You must define a field as identifier for the update mode');
         }
 
-        // An array for errors to return at the end.
-        $errors = array();
+        // Initialize the import result
+        $result = new DataImportResult();
+
 
         // Try to open the file in read mode
         $handle = fopen($this->filename, 'r');
@@ -234,6 +250,10 @@ class DataImportHandler
             /** @var array $data */
             while (($data = fgetcsv($handle, 10000, $this->separator)) !== FALSE) {
 
+                if ($debug && $line % 100 == 0) {
+                    echo sprintf('%d lignes traitées', $line), PHP_EOL;
+                }
+
                 $data = $this->convertUtf8($data);
 
                 $object = null;
@@ -250,19 +270,50 @@ class DataImportHandler
                     }
 
                     if ($this->importMode == self::ONLY_UPDATE && !$object) {
-                        $errors[] = sprintf('The object (%s) was not found with a %s corresponding to "%s"', $this->classname, $this->identifierFieldname, $identifierValue);
+                        $result->addError(sprintf('The object (%s) was not found with a %s corresponding to "%s"', $this->classname, $this->identifierFieldname, $identifierValue));
                         continue;
                     }
 
                 }
 
+                if ($object) {
+                    $result->incrementUpdateCount();
+                }
+
+                // If we just create objects
+                if ($this->importMode == self::ONLY_CREATE) {
+
+                    // Check if a "check for existance" closure is set
+                    if ($this->getCheckForExistanceClosure()) {
+
+                        // If it's set, we test it.
+                        // The closure must return false il the entity doesn't exist
+                        $closure = $this->getCheckForExistanceClosure();
+                        if ($closure($data)) {
+                            // If the closure says that the entity exists, we do not create it and go to the next line
+                            ++$line;
+                            continue;
+                        }
+                    }
+
+                    // If there is no closure set, we just go over
+                }
+
                 if ($this->importMode == self::CREATE_AND_UPDATE || $this->importMode == self::ONLY_CREATE) {
                     if (!$object) {
+                        $result->incrementCreateCount();
+
                         $object = new $this->classname();
 
-                        $identifierSetter = 'set' . ucfirst($this->identifierFieldname);
-                        if (method_exists($object, $identifierSetter)) {
-                            $object->$identifierSetter($identifierValue);
+                        if ($this->identifierFieldname && isset($identifierValue)) {
+                            if ($this->identifierPosition && array_key_exists($this->identifierPosition, $this->fields)) {
+                                $this->applyHook($identifierValue, $this->fields[$this->identifierPosition], $object);
+                            }
+
+                            $identifierSetter = 'set' . ucfirst($this->identifierFieldname);
+                            if (method_exists($object, $identifierSetter)) {
+                                $object->$identifierSetter($identifierValue);
+                            }
                         }
 
                     }
@@ -283,22 +334,23 @@ class DataImportHandler
                         continue;
                     }
 
-                    // We do not update the identifier value here
-                    if ($index == $this->identifierPosition) {
+                    // We do not update the identifier value here, if there is an identifier
+                    if ($this->identifierFieldname && $index == $this->identifierPosition) {
                         continue;
                     }
 
                     /** @var FieldDescription $fieldDescription */
                     $fieldDescription = $this->getFieldByPosition($index);
 
-                    // Check if the value is empty and required
-                    if (!$value && $fieldDescription->isRequired()) {
-                        $errors[] = sprintf('At line %d : The field %s (position %d) cannot be empty', $line, $fieldDescription->getFieldname(), $index);
-                        break;
-                    }
-
                     // Apply HOOK
                     $this->applyHook($value, $fieldDescription, $object);
+
+                    // Check if the value is empty and required
+                    if (!$value && $value !== false && $value != "0" && $fieldDescription->isRequired()) {
+                        $lineHasError = true;
+                        $result->addError(sprintf('At line %d : The field %s (position %d) cannot be empty', $line, $fieldDescription->getFieldname(), $index));
+                        break;
+                    }
 
                     // Setting value to object
                     $this->setValue($object, $value, $fieldDescription);
@@ -312,25 +364,104 @@ class DataImportHandler
                     continue;
                 }
 
-                $objectCollection[] = $object;
+                if ($this->importMode == self::CREATE_AND_UPDATE || $this->importMode == self::ONLY_UPDATE) {
+                    $objectCollection[$data[$this->identifierPosition]] = $object;
+
+                } else {
+                    $objectCollection[] = $object;
+                }
+
+            }
+
+            if ($debug) {
+                --$line;
+                echo sprintf('%d lines processed', $this->containsHeaders ? --$line : $line), PHP_EOL;
             }
 
             // Save all objects contained in the collection
-            try {
-                foreach ($objectCollection as $object) {
-                    $this->em->persist($object);
-                }
+            if ($debug) {
+                echo PHP_EOL,
+                '-------------------------------------------------------', PHP_EOL,
+                sprintf('Start saving objects (%d objects)...', count($objectCollection)), PHP_EOL,
+                '-------------------------------------------------------',
+                PHP_EOL;
+            }
 
-                $this->em->flush();
-            } catch (\Exception $e) {
-                $errors[] = $e->getMessage();
+            if (!$fake) {
+                try {
+                    if (count($objectCollection) > 10000) {
+                        $this->em->getConnection()->getConfiguration()->setSQLLogger(null);
+                    }
+
+                    gc_enable();
+
+                    $count = 0;
+                    $emCleared = false;
+
+                    $associationNames = $this->em->getClassMetadata($this->classname)->getAssociationNames();
+                    $associationNamesCount = count($associationNames);
+
+                    foreach ($objectCollection as $object) {
+
+                        if ($emCleared) {
+                            // Get all associations for object and merge them after the clear command
+                            for ($i = 0; $i < $associationNamesCount; ++$i) {
+                                $assoName = $associationNames[$i];
+
+                                $objAsso = $object->{'get' . $assoName}();
+                                if ($objAsso && is_object($objAsso) && !($objAsso instanceof ArrayCollection)) {
+                                    $object->{'set' . $assoName}($this->em->merge($objAsso));
+                                }
+                            }
+                        }
+
+                        // Apply a prePersist hook on the object if the closure has been set
+                        $prePersistClosure = $this->getPrePersistClosure();
+                        if ($prePersistClosure instanceof \Closure) {
+                            $prePersistClosure($object);
+                        }
+
+                        $this->em->persist($object);
+
+                        // Apply a postPersist hook on the object if the closure has been set
+                        $postPersistClosure = $this->getPostPersistClosure();
+                        if ($postPersistClosure instanceof \Closure) {
+                            $postPersistClosure($object);
+                        }
+
+                        if (++$count % 10000 == 0) {
+                            $this->em->flush();
+                            $this->em->clear();
+                            gc_collect_cycles();
+                            $emCleared = true;
+
+                            if ($debug) {
+                                echo sprintf('%d objects saved on %d...', $count, count($objectCollection)), PHP_EOL;
+                            }
+                        }
+                    }
+
+                    $this->em->flush();
+                    $this->em->clear();
+                    gc_collect_cycles();
+
+                    if ($debug) {
+                        echo 'Datebase record completed',
+                        '-------------------------------------------------------',
+                        PHP_EOL,
+                        PHP_EOL;
+                    }
+
+                } catch (\Exception $e) {
+                    $result->addError($e->getMessage());
+                }
             }
 
         } else {
-            $errors[] = sprintf('The file %s could not be open', $this->filename);
+            $result->addError(sprintf('The file %s could not be open', $this->filename));
         }
 
-        return $errors;
+        return $result;
     }
 
     /**
@@ -360,6 +491,8 @@ class DataImportHandler
         $setter = $fieldDescription->getSetter();
         if (method_exists($object, $setter)) {
             $object->$setter($value);
+        } else {
+            throw new \BadMethodCallException(sprintf('The %s class must provide a method named %s', get_class($object), $setter));
         }
     }
 
@@ -373,6 +506,8 @@ class DataImportHandler
         foreach ($array as $key => $value) {
             $array[$key] = $this->convertUtf8($value);
         }
+
+        return $array;
     }
 
     /**
@@ -385,11 +520,15 @@ class DataImportHandler
      */
     protected function convertUtf8($data)
     {
+        if (is_array($data)) {
+            return $this->convertArrayUtf8($data);
+        }
+
         if (mb_detect_encoding($data, "UTF-8", true) != 'UTF-8') {
             $data = utf8_encode($data);
         }
 
-        return $data;
+        return trim($data);
     }
 
     /**
@@ -423,6 +562,59 @@ class DataImportHandler
     public function setIdentifierPosition($identifierPosition)
     {
         $this->identifierPosition = $identifierPosition;
+        return $this;
+    }
+
+    /**
+     * @return \Closure
+     */
+    public function getCheckForExistanceClosure()
+    {
+        return $this->checkForExistanceClosure;
+    }
+
+    /**
+     * @param \Closure $checkForExistanceClosure
+     */
+    public function setCheckForExistanceClosure($checkForExistanceClosure)
+    {
+        $this->checkForExistanceClosure = $checkForExistanceClosure;
+        return $this;
+    }
+
+    /**
+     * @return mixed
+     */
+    public function getPrePersistClosure()
+    {
+        return $this->prePersistClosure;
+    }
+
+    /**
+     * @param mixed $prePersistClosure
+     */
+    public function setPrePersistClosure($prePersistClosure)
+    {
+        $this->prePersistClosure = $prePersistClosure;
+
+        return $this;
+    }
+
+    /**
+     * @return mixed
+     */
+    public function getPostPersistClosure()
+    {
+        return $this->postPersistClosure;
+    }
+
+    /**
+     * @param mixed $postPersistClosure
+     */
+    public function setPostPersistClosure($postPersistClosure)
+    {
+        $this->postPersistClosure = $postPersistClosure;
+
         return $this;
     }
 
